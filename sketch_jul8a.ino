@@ -17,7 +17,7 @@ void connectToWiFi() {
     Serial.println("Attempting to establish Wi-Fi connection...");
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     while (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Connection failed. Retrying...")
+        Serial.println("Connection failed. Retrying...");
         delay(1000);
     }
     Serial.println("Wi-Fi connection successful!");
@@ -38,12 +38,13 @@ void connectToMQTT() {
 // entry point
 // executed once by the Arduino on startup
 void setup() {
+    Serial.begin(115200);
     connectToWiFi();
     connectToMQTT();
-    tempSensor.setup();
+    tempSensor->setup();
 
     // attempt a ping to test Wi-Fi connection
-    char[] hostName = "www.google.com";
+    const char* hostName = "www.google.com";
     Serial.print("Pinging ");
     Serial.print(hostName);
     Serial.println("... ");
@@ -70,5 +71,10 @@ void loop() {
     Serial.println("°C");
 
     Serial.print("\n---\n");
+    if (!mqttClient.connected()) {
+        connectToMQTT();
+    }
+    tempSensor->publishData(mqttClient, MQTT_TOPIC_TEMPERATURE);
+
     delay(5000);
 }
