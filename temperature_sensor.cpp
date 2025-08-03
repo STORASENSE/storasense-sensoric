@@ -1,24 +1,20 @@
-// temperature_sensor.cpp
 #include "temperature_sensor.h"
 #include <Arduino.h>
-#include <Wire.h>
 
-TemperatureSensor::TemperatureSensor(const char* sensorName,
+// Use sensorID = 1 for this instance
+TemperatureSensor::TemperatureSensor(const char* sensorName, const String& sensorID,
                                      Adafruit_ADT7410 temperatureSensor)
-  : AbstractSensor(sensorName),
-    sensor(temperatureSensor)
-{}
+    : AbstractSensor("temp", sensorID, sensorName, "CELSIUS"), sensor(temperatureSensor) {}
 
 bool TemperatureSensor::setup() {
     if (!sensor.begin()) {
         return false;
     }
-    delay(250);  // Zeit für den ersten Messwert
+    delay(250);
     sensor.setResolution(ADT7410_16BIT);
     return true;
 }
 
-// Hier die const‑Methoden‑Signatur wie in AbstractSensor
 float TemperatureSensor::readData() {
     return sensor.readTempC();
 }

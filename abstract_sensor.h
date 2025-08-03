@@ -1,63 +1,34 @@
+#pragma once
 #include <ArduinoMqttClient.h>
 
-#ifndef SENSORIC_SOLUTION_ABSTRACT_SENSOR_H
-#define SENSORIC_SOLUTION_ABSTRACT_SENSOR_H
+// Damit abstract_sensor.cpp die Zeit-Funktion und Startup-Variable kennt
+unsigned long getTimestamp();
+extern unsigned long startupTs;
 
-
-/**
- * This class represents a sensor on an Arduino board. The method <code>AbstractSensor::readData</code>
- * can be used to read data from the sensor, and needs to be overridden in appropriate subclasses.
- *
- * Additionally, this class provides a functionality to send the sensor's data to an MQTT broker.
- * This can be achieved with the <code>AbstractSensor::publishData</code> method, and is implemented
- * by default.
- */
 class AbstractSensor {
-
-private:
-    /**
-     * The sensor's name.
-     */
-    const char* name;
-
 public:
-
-    /**
-     * Creates a sensor.
-     * @param sensorName The sensor's name.
-     */
-    AbstractSensor(const char* sensorName);
-
+    AbstractSensor(const char* sensorType, const String& sensorID, const char* sensorName, const char* sensorUnit);
     virtual ~AbstractSensor() = default;
 
-    /**
-     * Retrieves the sensor's name.
-     * @return The sensor's name.
-     */
-    const char* getName();
+    void publishData(MqttClient& client);
 
-    /**
-     * Publishes the read data from this sensor to the MQTT server.
-     * Specifically, invokes <code>AbstractSensor::readData</code> to read data from this sensor
-     * and then sends the data as a message to the given MQTT topic
-     * using the given MQTT client.
-     * @param client The MQTT client
-     * @param topic The MQTT topic to publish the data to
-     */
-    void publishData(MqttClient& client, const char* topic);
+    virtual bool   setup()    = 0;
+    virtual float  readData() = 0;
 
-    /**
-     * This method should be executed once to setup the sensor.
-     * @return Whether the setup was successful
-     */
-    virtual bool setup() = 0;
+protected:
+    const char* buildTopic();
 
-    /**
-     * Reads data from the sensor and returns it as a float.
-     * @return The sensor's read data
-     */
-    virtual float readData() = 0;
-
+private:
+    static constexpr const char* BASE_PREFIX   = "dhbw/ai/si2023/4";
+    const char*                 sensorType;
+    String                      sensorID;
+    const char*                 name;
+    const char*                 unit;
+    static constexpr size_t TOPIC_BUF_SIZE = 16  // strlen("dhbw/ai/si2023/4")
+                                        + 1  // slash
+                                        + 8  // max. sensorType (z.B. "humidity")
+                                        + 1  // slash
+                                        + 36 // UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+                                        + 1; // null-terminator
+    char                        topicBuf[TOPIC_BUF_SIZE];
 };
-
-#endif
