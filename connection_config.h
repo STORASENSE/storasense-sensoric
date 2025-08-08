@@ -12,7 +12,4 @@ const int MQTT_SERVER_PORT = 1883;
 const char* MQTT_USERNAME = "cikrika.tin23";
 const char* MQTT_PASSWORD = "AlyGeheim123!";
 
-// MQTT topics
-const char* MQTT_TOPIC_TEMPERATURE = "sensor/temperature";
-
 #endif
