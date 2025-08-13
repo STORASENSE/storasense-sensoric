@@ -1,16 +1,19 @@
-#include <WiFi.h>
+#include <WiFiNINA.h>
 #include <ArduinoMqttClient.h>
 #include "connection_config.h"      // WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER_IP, MQTT_SERVER_PORT, MQTT_USERNAME, MQTT_PASSWORD
-#include "temperature_sensor.h"
+#include "temperature_sensor_inside.h"
+#include "gas_sensor.h"
+#include "ultrasonic_sensor.h"
 #include "Adafruit_ADT7410.h"
 #include "wiring_private.h"         // für NVIC_SystemReset()
 #include "humidity_sensor.h"
+#include "time_provider.h" 
 #include "sam.h"
 #include <MD5.h>
 
 // ——— Parameter ———
 const int    MAX_ATTEMPTS           = 3;
-const long   RECONNECT_WINDOW_MS    = 30000;  // 30 s-Fenster für Versuche
+const long   RECONNECT_WINDOW_MS    = 30000;  // 30 s-Fenster für Versuche
 const int    KEEP_ALIVE_INTERVAL_S  = 5;      // MQTT Keep-Alive
 
 // ——— State ———
@@ -21,16 +24,12 @@ unsigned long windowStart = 0;
 WiFiClient         wifiClient;
 MqttClient         mqttClient(wifiClient);
 
-TemperatureSensor* tempSensor;
+const float DOOR_OPEN_THRESHOLD_CM = 100.0f;
+
+TemperatureSensorInside* tempSensorInside;
 HumiditySensor*    humSensor;
-
-// ganz oben in sketch_jul8a.ino, nach den anderen Includes
-unsigned long startupTs;
-
-// liefert einfache Epoch-Sekunden seit Sketch-Start
-unsigned long getTimestamp() {
-  return millis() / 1000;
-}
+GasSensor*         gasSensor; 
+UltrasonicSensor* ultraSensor;
 
 // Wi-Fi verbinden
 void connectToWiFi() {
@@ -130,19 +129,28 @@ void setup() {
     String ns = chipUIDHex();
 
     // 2) Zwei feste UUIDs erzeugen
-    String uuidTemp = makeUUIDv3(ns, "Temperature");
+    String uuidTempInside = makeUUIDv3(ns, "TemperatureInside");
+    String uuidTempOutside = makeUUIDv3(ns, "TemperatureOutside");
     String uuidHum  = makeUUIDv3(ns, "Humidity");
+    String uuidUltra = makeUUIDv3(ns, "Ultrasound");
+    String uuidGas   = makeUUIDv3(ns, "Gas");
 
-    Serial.println("UUID Temp:     " + uuidTemp);
+    Serial.println("UUID TempInside:     " + uuidTempInside);
+    Serial.println("UUID TempOutside:     " + uuidTempOutside);
     Serial.println("UUID Humidity: " + uuidHum);
+    Serial.println("UUID Ultrasound: " + uuidUltra);
+    Serial.println("UUID Gas:        " + uuidGas);
+
 
     // 3) Sensoren damit instanziieren
-    tempSensor = new TemperatureSensor("Inside",  uuidTemp, Adafruit_ADT7410());
+    tempSensorInside = new TemperatureSensorInside("Inside",  uuidTempInside, Adafruit_ADT7410());
     humSensor  = new HumiditySensor("Humidity",   uuidHum);
+    gasSensor  = new GasSensor("MQ2", uuidGas, A0);
+    ultraSensor = new UltrasonicSensor("Ultra", uuidUltra, 9, 10);
 
     connectToWiFi();
 
-    if (!tempSensor->setup()) {
+    if (!tempSensorInside->setup()) {
         Serial.println("Temperature-Sensor setup failed, restarting…");
         NVIC_SystemReset();
     }
@@ -150,17 +158,28 @@ void setup() {
         Serial.println("Humidity-Sensor setup failed, restarting…");
         NVIC_SystemReset();
     }
+    if (!gasSensor->setup()) {                             
+        Serial.println("Gas-Sensor setup failed, restarting…"); 
+        NVIC_SystemReset();
+    }
+
+    if (!ultraSensor->setup()) {
+        Serial.println("Ultraschall-Sensor Setup fehlgeschlagen!");
+        NVIC_SystemReset();
+    }
+
+    waitForValidTime();
 
     windowStart = millis();
     Serial.println("\n--- Setup fertig ---\n");
 
     tryConnectMQTT();
-
-    startupTs = getTimestamp();
 }
 
 void loop() {
     unsigned long now = millis();
+    static unsigned long gasPreheatStart = 0;
+    static bool gasReady = false;
 
     // — Reconnect-Fenster zurücksetzen —
     if (now - windowStart > RECONNECT_WINDOW_MS) {
@@ -183,17 +202,42 @@ void loop() {
         NVIC_SystemReset();
     }
 
+    // //1) Preheat-Phase für den MQ-2
+    // if (!gasReady) {
+    //     // Merke dir den Startzeitpunkt nur einmal
+    //     if (gasPreheatStart == 0) {
+    //     gasPreheatStart = now;
+    //     Serial.println("MQ-2 heizt vor…");
+    //     }
+    //     // Solange noch keine 180 000 ms vergangen sind, nur warten
+    //     if (now - gasPreheatStart < 180000) {
+    //     // optional: mit etwas Abstand eine Statusmeldung
+    //     static unsigned long lastMsg = 0;
+    //     if (now - lastMsg > 15000) {  // alle 15 s
+    //         Serial.print("Vorheizen: ");
+    //         Serial.print((now - gasPreheatStart) / 1000);
+    //         Serial.println(" s");
+    //         lastMsg = now;
+    //     }
+    //     delay(500);
+    //     return;  // kein Publish, kein Read 
+    //     }
+    //     // Preheat abgeschlossen
+    //     gasReady = true;
+    //     Serial.println("MQ-2 vorgeheizt – Messungen starten");
+    // }
+
     // — MQTT-Publish —
     if (mqttClient.connected()) {
         // Keep-Alive & Paketversand
         mqttClient.poll();
 
         // Temperatur lesen und veröffentlichen
-        float temperature = tempSensor->readData();
+        float temperature = tempSensorInside->readData();
         Serial.print("Temperature: ");
         Serial.print(temperature);
         Serial.println("°C\n---");
-        tempSensor->publishData(mqttClient);
+        tempSensorInside->publishData(mqttClient);
 
         // Feuchte lesen und veröffentlichen
         float humidity = humSensor->readData();
@@ -202,6 +246,34 @@ void loop() {
         Serial.println(" %\n---");
         humSensor->publishData(mqttClient);
 
+        float gasValue = gasSensor->readData();
+        Serial.print("Gas concentration: ");
+        Serial.println(gasValue);
+        Serial.println(" ppm\n---");
+        gasSensor->publishData(mqttClient);
+
+        float distCm = ultraSensor->readData();
+        if (distCm < 0) {
+            Serial.println("Ultraschall: kein Echo");
+        } else {
+            Serial.print("Distanz: ");
+            Serial.print(distCm, 1);
+            Serial.println(" cm");
+
+        bool doorOpen = (distCm < DOOR_OPEN_THRESHOLD_CM);
+        Serial.print("Status: Tür ");
+        Serial.println(doorOpen ? "OFFEN" : "ZU");
+
+        // Standard-Publish (nutzt readData() intern)
+        ultraSensor->publishData(mqttClient);
+
+        // Optional: reines On/Off-Topic
+        mqttClient.beginMessage("sensor/door/state");
+        mqttClient.print(doorOpen ? 0 : 1);
+        mqttClient.endMessage();
+        }
+
+        Serial.println("---");
         delay(5000);
     } else {
         if (tryConnectMQTT()) {
