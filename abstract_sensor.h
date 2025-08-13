@@ -26,7 +26,7 @@ private:
     const char*                 unit;
     static constexpr size_t TOPIC_BUF_SIZE = 16  // strlen("dhbw/ai/si2023/4")
                                         + 1  // slash
-                                        + 8  // max. sensorType (z.B. "humidity")
+                                        + 19  // max. sensorType (z.B. "humidity")
                                         + 1  // slash
                                         + 36 // UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
                                         + 1; // null-terminator

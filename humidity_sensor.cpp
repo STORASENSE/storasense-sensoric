@@ -1,18 +1,22 @@
 #include "humidity_sensor.h"
-#include <Arduino.h>
+
+HumiditySensor::HumiditySensor(const char* sensorName,
+                               const String& sensorID,
+                               uint8_t pin,
+                               uint8_t type)
+  : AbstractSensor("HUMIDITY", sensorID, sensorName, "PERCENT"),
+    sensor(pin, type)
+{}
 
 bool HumiditySensor::setup() {
-    // DHT-Sensor initialisieren
     sensor.begin();
     return true;
 }
 
 float HumiditySensor::readData() {
-    // Luftfeuchtigkeit auslesen
     float h = sensor.readHumidity();
-    // Bei ungültigem Wert 0 zurückgeben
     if (isnan(h)) {
-        return 0.0f;
+        return -1.0f;
     }
     return h;
 }
