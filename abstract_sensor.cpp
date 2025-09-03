@@ -2,14 +2,12 @@
 #include <ArduinoJson.h>
 #include <cstdio>  // für snprintf
 
-// JSON-Kapazität: timestamp, value[], sequence, meta.startup + Puffer
 static const size_t JSON_CAPACITY =
   JSON_OBJECT_SIZE(4) +
   JSON_ARRAY_SIZE(1) +
   JSON_OBJECT_SIZE(1) +
   128;
 
-// 1) Konstruktor implementieren
 AbstractSensor::AbstractSensor(const char* sensorType_,
                                const String& sensorID_,
                                const char* sensorName_,
@@ -20,7 +18,6 @@ AbstractSensor::AbstractSensor(const char* sensorType_,
     unit(sensorUnit_)
 {}
 
-// 2) buildTopic implementieren
 const char* AbstractSensor::buildTopic() {
     snprintf(topicBuf,
             TOPIC_BUF_SIZE,
@@ -31,7 +28,6 @@ const char* AbstractSensor::buildTopic() {
     return topicBuf;
 }
 
-// 3) publishData wie gewünscht
 void AbstractSensor::publishData(MqttClient& client) {
     float value = readData();
 
@@ -41,13 +37,15 @@ void AbstractSensor::publishData(MqttClient& client) {
     JsonArray arr = doc.createNestedArray("value");
     arr.add(value);
 
-
     static unsigned long sequence = 0;
     doc["sequence"] = sequence++;
 
     JsonObject meta = doc.createNestedObject("meta");
     meta["startup"] = startupTs;
     meta["unit"] = unit;
+    #ifdef SIM_MODE
+      meta["simulated"] = true;
+    #endif
 
     const char* topic = buildTopic();
     client.beginMessage(topic);
