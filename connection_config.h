@@ -3,8 +3,8 @@
 
 
 // connection config for Wi-Fi
-const char* WIFI_SSID = "ALEYNA-PC7444";
-const char* WIFI_PASSWORD = "geheim123";
+const char* WIFI_SSID = "AI401";
+const char* WIFI_PASSWORD = "INF401AI4711";
 
 // connection config for MQTTT
 const char* MQTT_SERVER_IP = "aicon.dhbw-heidenheim.de";

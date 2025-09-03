@@ -1,289 +1,303 @@
+// ===== Schalter =====
+#define SIM_MODE     0   // 0 = Hardware, 1 = Simulation
+#define STRESS_MODE  0   // 0 = normal (HW oder 4er-Sim), 1 = Stresstest
+
 #include <WiFiNINA.h>
 #include <ArduinoMqttClient.h>
-#include "connection_config.h"      // WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER_IP, MQTT_SERVER_PORT, MQTT_USERNAME, MQTT_PASSWORD
-#include "temperature_sensor_inside.h"
-#include "gas_sensor.h"
-#include "ultrasonic_sensor.h"
-#include "Adafruit_ADT7410.h"
-#include "wiring_private.h"         // für NVIC_SystemReset()
-#include "humidity_sensor.h"
-#include "time_provider.h" 
+#include "connection_config.h"
+#include "time_provider.h"
 #include "sam.h"
 #include <MD5.h>
 
-// ——— Parameter ———
-const int    MAX_ATTEMPTS           = 3;
-const long   RECONNECT_WINDOW_MS    = 30000;  // 30 s-Fenster für Versuche
-const int    KEEP_ALIVE_INTERVAL_S  = 5;      // MQTT Keep-Alive
+#if STRESS_MODE
+  #include "stress_simulator.h"
+#elif SIM_MODE
+  #include "sim_presets.h"
+  #include "simulated_sensor.h"
+#else
+  #include "temperature_sensor_inside.h"
+  #include "humidity_sensor.h"
+  #include "gas_sensor.h"
+  #include "ultrasonic_sensor.h"
+  #include "Adafruit_ADT7410.h"
+  #include "wiring_private.h"
+  #include "temperature_sensor_outside.h" 
+#endif
 
-// ——— State ———
+// ---- Parameter / State ----
+const int    MAX_ATTEMPTS           = 3;
+const long   RECONNECT_WINDOW_MS    = 30000;
+const int    KEEP_ALIVE_INTERVAL_S  = 5;
+
 int          attempts     = 0;
 unsigned long windowStart = 0;
 
-// ——— Clients & Sensoren ———
-WiFiClient         wifiClient;
-MqttClient         mqttClient(wifiClient);
+const int    MAX_WIFI_ATTEMPTS        = 5;
+const unsigned long WIFI_TRY_TIMEOUT  = 10000;
 
-const float DOOR_OPEN_THRESHOLD_CM = 100.0f;
+WiFiClient   wifiClient;
+MqttClient   mqttClient(wifiClient);
 
-TemperatureSensorInside* tempSensorInside;
-HumiditySensor*    humSensor;
-GasSensor*         gasSensor; 
-UltrasonicSensor* ultraSensor;
+// Nur für HW/4er-Sim relevant:
+const float DOOR_OPEN_THRESHOLD_CM = 188.0f;
 
-// Wi-Fi verbinden
+// ==== STRESS KONFIG ====
+#if STRESS_MODE
+  static StressSimulator* stress = nullptr;
+  static const StressCfg STRESS_CFGS[] = {
+    { "TEMPERATURE_INSIDE", "TempIn", "CELSIUS",    SimPreset::TEMP,  false },
+    { "TEMPERATURE_OUTSIDE", "TempOut",  "CELSIUS",    SimPreset::TEMP,  false },
+    { "HUMIDITY",           "Hum",    "PERCENT",    SimPreset::HUMI,  false },
+    { "CO2",                "Gas",    "PPM",        SimPreset::GAS,   false },
+    { "ULTRASONIC",         "Ultra",  "CENTIMETER", SimPreset::ULTRA, true  },
+  };
+#else
+  AbstractSensor* tempSensorInside = nullptr;
+  AbstractSensor* tempSensorOutside = nullptr;
+  AbstractSensor* humSensor        = nullptr;
+  AbstractSensor* gasSensor        = nullptr;
+  AbstractSensor* ultraSensor      = nullptr;
+#endif
+
 void connectToWiFi() {
-    Serial.println("Attempting to establish Wi-Fi connection…");
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Connection failed. Retrying…");
-        delay(1000);
+  Serial.println("Connecting to Wi-Fi…");
+  WiFi.disconnect(); delay(100);
+  int tries = 0; unsigned long attemptStart = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    if (tries == 0 || (millis() - attemptStart) > WIFI_TRY_TIMEOUT) {
+      tries++; attemptStart = millis();
+      Serial.print("Wi-Fi try #"); Serial.println(tries);
+      WiFi.disconnect(); delay(100);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
-    Serial.println("Wi-Fi connection successful!");
+    delay(250);
+    if (tries >= MAX_WIFI_ATTEMPTS) { Serial.println("Wi-Fi failed → Reset"); delay(100); NVIC_SystemReset(); }
+  }
+  Serial.print("Wi-Fi OK, IP: "); Serial.println(WiFi.localIP());
 }
 
-// Prüfen, ob Broker erreichbar ist
 bool isBrokerReachable() {
-    WiFiClient testClient;
-    bool ok = testClient.connect(MQTT_SERVER_IP, MQTT_SERVER_PORT);
-    if (ok) testClient.stop();
-    return ok;
+  WiFiClient testClient;
+  bool ok = testClient.connect(MQTT_SERVER_IP, MQTT_SERVER_PORT);
+  if (ok) testClient.stop();
+  return ok;
 }
 
-// MQTT-Verbindung aufbauen
 bool tryConnectMQTT() {
-    Serial.println("Attempting MQTT connection…");
-    mqttClient.setUsernamePassword(MQTT_USERNAME, MQTT_PASSWORD);
-    mqttClient.setKeepAliveInterval(KEEP_ALIVE_INTERVAL_S);
-    if (mqttClient.connect(MQTT_SERVER_IP, MQTT_SERVER_PORT)) {
-        Serial.println("MQTT connection successful!");
-        return true;
-    } else {
-        Serial.print("MQTT connection failed, error: ");
-        Serial.println(mqttClient.connectError());
-        return false;
-    }
+  Serial.println("Attempting MQTT connection…");
+  mqttClient.setUsernamePassword(MQTT_USERNAME, MQTT_PASSWORD);
+  mqttClient.setKeepAliveInterval(KEEP_ALIVE_INTERVAL_S);
+  if (mqttClient.connect(MQTT_SERVER_IP, MQTT_SERVER_PORT)) {
+    Serial.println("MQTT connection successful!");
+    return true;
+  } else {
+    Serial.print("MQTT connection failed, error: ");
+    Serial.println(mqttClient.connectError());
+    return false;
+  }
 }
 
+// ---- Chip-ID / UUID ----
 static void readChipUID(uint8_t uid[16]) {
-    uint8_t* base = (uint8_t*)0x0080A00C;
-    for (int i = 0; i < 16; i++) {
-        uid[i] = base[i];
-    }
+  uint8_t* base = (uint8_t*)0x0080A00C;
+  for (int i = 0; i < 16; i++) uid[i] = base[i];
 }
-
 String makeUUIDv3(const String& nsHex, const String& name) {
-    // 1) Namespace+Name zusammenfassen
-    String input = nsHex + name;
-    int len = input.length();
-
-    // 2) In einen modifizierbaren Char-Puffer kopieren
-    char* mutableBuff = (char*)malloc(len + 1);
-    input.toCharArray(mutableBuff, len + 1);
-
-    // 3) MD5-Raw-Hash erzeugen (16 Bytes via malloc)
-    unsigned char* raw = MD5::make_hash(mutableBuff);
-
-    // Puffer freigeben – raw darf weiter leben
-    free(mutableBuff);
-
-    // 4) RFC4122: Version auf 3 setzen, Variant auf 10xxxxxx
-    raw[6] = (raw[6] & 0x0F) | 0x30;  
-    raw[8] = (raw[8] & 0x3F) | 0x80;  
-
-    // 5) In hex mit Bindestrichen formatieren
-    char uuid[37];
-    snprintf(uuid, sizeof(uuid),
-        "%02x%02x%02x%02x-"
-        "%02x%02x-"
-        "%02x%02x-"
-        "%02x%02x-"
-        "%02x%02x%02x%02x%02x%02x",
-        raw[0], raw[1], raw[2], raw[3],
-        raw[4], raw[5],
-        raw[6], raw[7],
-        raw[8], raw[9],
-        raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]
-    );
-
-    // 6) Hash-Speicher freigeben und String zurückgeben
-    free(raw);
-    return String(uuid);
+  String input = nsHex + name;
+  char* mutableBuff = (char*)malloc(input.length() + 1);
+  input.toCharArray(mutableBuff, input.length() + 1);
+  unsigned char* raw = MD5::make_hash(mutableBuff);
+  free(mutableBuff);
+  raw[6] = (raw[6] & 0x0F) | 0x30;  raw[8] = (raw[8] & 0x3F) | 0x80;
+  char uuid[37];
+  snprintf(uuid, sizeof(uuid),
+    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+    raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7],
+    raw[8],raw[9],raw[10],raw[11],raw[12],raw[13],raw[14],raw[15]);
+  free(raw);
+  return String(uuid);
 }
-
-// Macht daraus einen String mit Hex-Bytes (32 Zeichen)
 String chipUIDHex() {
-    uint8_t uid[16];
-    readChipUID(uid);
-    char buf[33];
-    for (int i = 0; i < 16; i++) sprintf(buf + i*2, "%02X", uid[i]);
-    buf[32] = '\0';
-    return String(buf);
+  uint8_t uid[16]; readChipUID(uid);
+  char buf[33]; for (int i=0;i<16;i++) sprintf(buf + i*2, "%02X", uid[i]); buf[32]='\0';
+  return String(buf);
 }
 
+// ----------------- setup -----------------
 void setup() {
-    Serial.begin(115200);
-    while (!Serial);
+  Serial.begin(115200);
+  unsigned long t0 = millis();
+  while (!Serial && (millis() - t0 < 1500)) { delay(10); }
 
-    // 1) Chip-UID in Hex
-    String ns = chipUIDHex();
+  String ns = chipUIDHex();
+  String uuidTempInside  = makeUUIDv3(ns, "TemperatureInside");
+  String uuidTempOutside = makeUUIDv3(ns, "TemperatureOutside");
+  String uuidHum         = makeUUIDv3(ns, "Humidity");
+  String uuidUltra       = makeUUIDv3(ns, "Ultrasound");
+  String uuidGas         = makeUUIDv3(ns, "Gas");
 
-    // 2) Zwei feste UUIDs erzeugen
-    String uuidTempInside = makeUUIDv3(ns, "TemperatureInside");
-    String uuidTempOutside = makeUUIDv3(ns, "TemperatureOutside");
-    String uuidHum  = makeUUIDv3(ns, "Humidity");
-    String uuidUltra = makeUUIDv3(ns, "Ultrasound");
-    String uuidGas   = makeUUIDv3(ns, "Gas");
+  Serial.println("UUID TempInside: "   + uuidTempInside);
+  Serial.println("UUID TempOutside: "  + uuidTempOutside);
+  Serial.println("UUID Humidity: "     + uuidHum);
+  Serial.println("UUID Ultrasound: "   + uuidUltra);
+  Serial.println("UUID Gas: "          + uuidGas);
 
-    Serial.println("UUID TempInside:     " + uuidTempInside);
-    Serial.println("UUID TempOutside:     " + uuidTempOutside);
-    Serial.println("UUID Humidity: " + uuidHum);
-    Serial.println("UUID Ultrasound: " + uuidUltra);
-    Serial.println("UUID Gas:        " + uuidGas);
+  connectToWiFi();
 
+#if STRESS_MODE
+  stress = new StressSimulator();
+  stress->begin(mqttClient, STRESS_CFGS, sizeof(STRESS_CFGS)/sizeof(STRESS_CFGS[0]));
+  Serial.println("Stress mode ON");
 
-    // 3) Sensoren damit instanziieren
-    tempSensorInside = new TemperatureSensorInside("Inside",  uuidTempInside, Adafruit_ADT7410());
-    humSensor  = new HumiditySensor("Humidity",   uuidHum);
-    gasSensor  = new GasSensor("MQ2", uuidGas, A0);
-    ultraSensor = new UltrasonicSensor("Ultra", uuidUltra, 9, 10);
+#elif SIM_MODE
+  // 4 feste Sim-Sensoren (dein alter Weg)
+  tempSensorInside = new SimulatedSensor("TEMPERATURE_INSIDE", uuidTempInside, "Inside",    "CELSIUS",    SimPreset::TEMP);
+  tempSensorOutisde = new SimulatedSensor("TEMPERATURE_OUTSIDE", uuidTempInside, "Outside",    "CELSIUS",    SimPreset::TEMP);
+  humSensor        = new SimulatedSensor("HUMIDITY",           uuidHum,        "Humidity",  "PERCENT",    SimPreset::HUMI);
+  gasSensor        = new SimulatedSensor("CO2",                uuidGas,        "Gas",       "PPM",        SimPreset::GAS);
+  ultraSensor      = new SimulatedSensor("ULTRASONIC",         uuidUltra,      "Ultra",     "CENTIMETER", SimPreset::ULTRA, true);
 
-    connectToWiFi();
+  if (!tempSensorInside->setup()) NVIC_SystemReset();
+  if (!tempSensorOutside->setup()) NVIC_SystemReset();
+  if (!humSensor->setup())        NVIC_SystemReset();
+  if (!gasSensor->setup())        NVIC_SystemReset();
+  if (!ultraSensor->setup())      NVIC_SystemReset();
 
-    if (!tempSensorInside->setup()) {
-        Serial.println("Temperature-Sensor setup failed, restarting…");
-        NVIC_SystemReset();
-    }
-    if (!humSensor->setup()) {
-        Serial.println("Humidity-Sensor setup failed, restarting…");
-        NVIC_SystemReset();
-    }
-    if (!gasSensor->setup()) {                             
-        Serial.println("Gas-Sensor setup failed, restarting…"); 
-        NVIC_SystemReset();
-    }
+#else
+  // Echte Hardware
+  tempSensorInside = new TemperatureSensorInside("Inside", uuidTempInside, Adafruit_ADT7410());
+  tempSensorOutside = new TemperatureSensorOutside("Outside", uuidTempOutside);
+  humSensor        = new HumiditySensor("Humidity", uuidHum);
+  gasSensor        = new GasSensor("MQ2", uuidGas, A0);
+  ultraSensor      = new UltrasonicSensor("Ultra", uuidUltra, 9, 10);
 
-    if (!ultraSensor->setup()) {
-        Serial.println("Ultraschall-Sensor Setup fehlgeschlagen!");
-        NVIC_SystemReset();
-    }
+  if (!tempSensorInside->setup()) NVIC_SystemReset();
+  if (!tempSensorOutside->setup()) NVIC_SystemReset();
+  if (!humSensor->setup())        NVIC_SystemReset();
+  if (!gasSensor->setup())        NVIC_SystemReset();
+  if (!ultraSensor->setup())      NVIC_SystemReset();
+#endif
 
-    waitForValidTime();
-
-    windowStart = millis();
-    Serial.println("\n--- Setup fertig ---\n");
-
-    tryConnectMQTT();
+  waitForValidTime();
+  windowStart = millis();
+  Serial.println("\n--- Setup fertig ---\n");
+  tryConnectMQTT();
 }
 
+// ----------------- loop -----------------
 void loop() {
-    unsigned long now = millis();
-    static unsigned long gasPreheatStart = 0;
-    static bool gasReady = false;
+  const unsigned long now = millis();
 
-    // — Reconnect-Fenster zurücksetzen —
-    if (now - windowStart > RECONNECT_WINDOW_MS) {
-        windowStart = now;
-        attempts    = 0;
-        Serial.println("Neues 30 s-Fenster – Versuchszähler zurückgesetzt");
-    }
-    if (!isBrokerReachable()) {
-        attempts++;
-        Serial.print("Broker unreachable, Versuch ");
-        Serial.print(attempts);
-        Serial.println("/3");
-    } else if (attempts > 0) {
-        Serial.println("Broker wieder erreichbar, Versuchszähler zurückgesetzt");
-        attempts = 0;
-    }
-    if (attempts >= MAX_ATTEMPTS) {
-        Serial.println("3 Fehlversuche – Neustart");
-        delay(100);
-        NVIC_SystemReset();
-    }
+  // --- Reconnect-Fenster / Versuchszähler ---
+  if (now - windowStart > RECONNECT_WINDOW_MS) {
+    windowStart = now;
+    attempts = 0;
+    Serial.println("Neues 30s-Fenster - Versuchszähler zurückgesetzt");
+  }
 
-    // //1) Preheat-Phase für den MQ-2
-    // if (!gasReady) {
-    //     // Merke dir den Startzeitpunkt nur einmal
-    //     if (gasPreheatStart == 0) {
-    //     gasPreheatStart = now;
-    //     Serial.println("MQ-2 heizt vor…");
-    //     }
-    //     // Solange noch keine 180 000 ms vergangen sind, nur warten
-    //     if (now - gasPreheatStart < 180000) {
-    //     // optional: mit etwas Abstand eine Statusmeldung
-    //     static unsigned long lastMsg = 0;
-    //     if (now - lastMsg > 15000) {  // alle 15 s
-    //         Serial.print("Vorheizen: ");
-    //         Serial.print((now - gasPreheatStart) / 1000);
-    //         Serial.println(" s");
-    //         lastMsg = now;
-    //     }
-    //     delay(500);
-    //     return;  // kein Publish, kein Read 
-    //     }
-    //     // Preheat abgeschlossen
-    //     gasReady = true;
-    //     Serial.println("MQ-2 vorgeheizt – Messungen starten");
-    // }
+  // === MQTT verbunden? ===
+  if (mqttClient.connected()) {
+    mqttClient.poll();
 
-    // — MQTT-Publish —
-    if (mqttClient.connected()) {
-        // Keep-Alive & Paketversand
-        mqttClient.poll();
+    #if (SIM_MODE && STRESS_MODE)
+      if (stress) {
+        stress->loop();
+      }
+      return;
+    #elif (SIM_MODE && !STRESS_MODE)
+      float temperature = tempSensorInside->readData();
+      Serial.print("Temperature: "); Serial.print(temperature); Serial.println(" °C");
+      tempSensorInside->publishData(mqttClient);
 
-        // Temperatur lesen und veröffentlichen
-        float temperature = tempSensorInside->readData();
-        Serial.print("Temperature: ");
-        Serial.print(temperature);
-        Serial.println("°C\n---");
-        tempSensorInside->publishData(mqttClient);
+      float temperatureOut = tempSensorOutside->readData();
+      Serial.print("Temperature (Outside): "); Serial.print(temperatureOut); Serial.println(" °C");
+      tempSensorOutside->publishData(mqttClient);
 
-        // Feuchte lesen und veröffentlichen
-        float humidity = humSensor->readData();
-        Serial.print("Humidity: ");
-        Serial.print(humidity);
-        Serial.println(" %\n---");
-        humSensor->publishData(mqttClient);
+      float humidity = humSensor->readData();
+      Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
+      humSensor->publishData(mqttClient);
 
-        float gasValue = gasSensor->readData();
-        Serial.print("Gas concentration: ");
-        Serial.println(gasValue);
-        Serial.println(" ppm\n---");
-        gasSensor->publishData(mqttClient);
+      float gasValue = gasSensor->readData();
+      Serial.print("Gas concentration: "); Serial.print(gasValue); Serial.println(" ppm");
+      gasSensor->publishData(mqttClient);
 
-        float distCm = ultraSensor->readData();
-        if (distCm < 0) {
-            Serial.println("Ultraschall: kein Echo");
-        } else {
-            Serial.print("Distanz: ");
-            Serial.print(distCm, 1);
-            Serial.println(" cm");
+      Serial.println("---");
+      delay(5000);
+    #else
+      float temperature = tempSensorInside->readData();
+      Serial.print("Temperature: "); Serial.print(temperature); Serial.println(" °C");
+      tempSensorInside->publishData(mqttClient);
 
-        bool doorOpen = (distCm < DOOR_OPEN_THRESHOLD_CM);
-        Serial.print("Status: Tür ");
-        Serial.println(doorOpen ? "OFFEN" : "ZU");
+      float humidity = humSensor->readData();
+      Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
+      humSensor->publishData(mqttClient);
 
-        // Standard-Publish (nutzt readData() intern)
+      float gasValue = gasSensor->readData();
+      Serial.print("Gas concentration: "); Serial.print(gasValue); Serial.println(" ppm");
+      gasSensor->publishData(mqttClient);
+
+      float distCm = ultraSensor->readData();
+      if (distCm < 0) {
+        Serial.println("Ultraschall: kein Echo");
+      } else {
+        Serial.print("Distanz: "); Serial.print(distCm, 1); Serial.println(" cm");
+        bool doorOpen = (distCm >= 0 && distCm < DOOR_OPEN_THRESHOLD_CM);
+        Serial.print("Status: Tür "); Serial.println(doorOpen ? "OFFEN" : "ZU");
+
         ultraSensor->publishData(mqttClient);
 
-        // Optional: reines On/Off-Topic
         mqttClient.beginMessage("sensor/door/state");
         mqttClient.print(doorOpen ? 0 : 1);
         mqttClient.endMessage();
-        }
 
-        Serial.println("---");
-        delay(5000);
-    } else {
-        if (tryConnectMQTT()) {
-            Serial.println("MQTT verbunden, ready to publish.");
-        } else {
-            attempts++;
-            Serial.print("MQTT connect fail, Versuch ");
-            Serial.print(attempts);
-            Serial.println("/3");
-            delay(1000);
+        unsigned long nowMs = millis();
+        Serial.print("Publish-Zeit (ms seit Start): ");
+        Serial.println(nowMs);
+
+      }
+      Serial.println("---");
+      delay(5000);
+    #endif
+
+    return;
+  }
+
+  static unsigned long lastRetry = 0;
+  const unsigned long RETRY_EVERY_MS = 1000; // 1s
+
+  if (now - lastRetry >= RETRY_EVERY_MS) {
+    lastRetry = now;
+
+    #if !(SIM_MODE && STRESS_MODE)
+      static unsigned long lastProbe = 0;
+      if (now - lastProbe >= 10000UL) {
+        lastProbe = now;
+        if (!isBrokerReachable()) {
+          attempts++;
+          Serial.print("Broker unreachable, Versuch ");
+          Serial.print(attempts);
+          Serial.println("/3");
+        } else if (attempts > 0) {
+          Serial.println("Broker wieder erreichbar, Versuchszähler zurückgesetzt");
+          attempts = 0;
         }
+      }
+    #endif
+
+    if (attempts >= MAX_ATTEMPTS) {
+      Serial.println("3 Fehlversuche - Neustart");
+      delay(100);
+      NVIC_SystemReset();
     }
+
+    if (tryConnectMQTT()) {
+      Serial.println("MQTT verbunden, ready to publish.");
+      attempts = 0;
+    } else {
+      attempts++;
+      Serial.print("MQTT connect fail, Versuch ");
+      Serial.print(attempts);
+      Serial.println("/3");
+    }
+  }
 }
